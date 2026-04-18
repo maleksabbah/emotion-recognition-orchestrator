@@ -5,7 +5,9 @@ Gateway calls these to create sessions, submit frames, check status.
 from __future__ import annotations
 
 import base64
+import os
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
@@ -48,6 +50,12 @@ class SubmitUploadRequest(BaseModel):
     session_id: str
     mode: SessionMode
     s3_key: str
+
+
+class PresignRequest(BaseModel):
+    session_id: str
+    filename: str
+    content_type: str
 
 
 # ── Routes ───────────────────────────────────
@@ -104,6 +112,33 @@ async def submit_upload_job(req: SubmitUploadRequest, request: Request):
         priority=priority,
     )
     return {"status": "queued", "session_id": req.session_id}
+
+
+@router.post("/upload/presign")
+async def presign_upload(req: PresignRequest):
+    """Proxy presign request to the storage service (which has S3/MinIO access)."""
+    storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{storage_url}/internal/presign/upload",
+                json={
+                    "session_id": req.session_id,
+                    "file_type": "source",
+                    "mime_type": req.content_type,
+                    "original_filename": req.filename,
+                },
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Storage error: {resp.text}")
+            data = resp.json()
+            return {
+                "upload_url": data["upload_url"],
+                "s3_key": data["s3_key"],
+            }
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Storage unreachable: {e}")
 
 
 @router.get("/sessions/{session_id}/status", response_model=JobStatusResponse)
