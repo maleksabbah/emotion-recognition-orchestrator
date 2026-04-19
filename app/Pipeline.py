@@ -64,10 +64,10 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
-# Float → label converters (for FrontendFace)
+# Float → label converters
+# Worker publishes raw floats; DB + frontend both want categorical labels.
 # ──────────────────────────────────────────────
 def _valence_label(v: float) -> str:
-    """Map valence score to a categorical label."""
     if v < 0.4:
         return "negative"
     if v < 0.6:
@@ -76,12 +76,10 @@ def _valence_label(v: float) -> str:
 
 
 def _arousal_label(a: float) -> str:
-    """Map arousal score to a categorical label."""
     return "high" if a >= 0.5 else "low"
 
 
 def _intensity_label(i: float) -> str:
-    """Map intensity score to a categorical label."""
     if i < 0.34:
         return "low"
     if i < 0.67:
@@ -287,22 +285,25 @@ class PipelineManager:
         result = InferenceResult(**payload)
         session_id = result.session_id
 
-        # Log prediction to PostgreSQL (batched) — keep raw floats here
+        # Worker sends raw floats; DB + frontend both want categorical labels.
+        valence_label = _valence_label(result.valence)
+        arousal_label = _arousal_label(result.arousal)
+        intensity_label = _intensity_label(result.intensity)
+
+        # Log prediction to PostgreSQL (batched) — labels, per Batch_writer contract
         await self.writer.add_prediction(
             detection_id=result.detection_id,
             emotions=result.emotions.model_dump(),
             top_emotion=result.top_emotion,
             top_confidence=result.top_confidence,
-            valence=result.valence,
-            arousal=result.arousal,
-            intensity=result.intensity,
+            valence=valence_label,
+            arousal=arousal_label,
+            intensity=intensity_label,
             inference_time_ms=result.inference_time_ms,
             worker_id=result.worker_id,
         )
 
-        # Build and publish frontend payload via Redis
-        # FrontendFace expects STRING labels for valence/arousal/intensity,
-        # so convert the raw floats from InferenceResult.
+        # Build and publish frontend payload via Redis (labels too)
         frontend_frame = FrontendFrame(
             session_id=session_id,
             frame_number=result.frame_number,
@@ -314,9 +315,9 @@ class PipelineManager:
                 top_emotion=result.top_emotion,
                 top_confidence=result.top_confidence,
                 emotions=result.emotions,
-                valence=_valence_label(result.valence),
-                arousal=_arousal_label(result.arousal),
-                intensity=_intensity_label(result.intensity),
+                valence=valence_label,
+                arousal=arousal_label,
+                intensity=intensity_label,
             )],
         )
         await publish_live(self.redis, session_id, frontend_frame.model_dump())
@@ -419,8 +420,6 @@ class PipelineManager:
         """Poll Redis for live frames pushed by the gateway."""
         while True:
             try:
-                # Check all active sessions for queued frames
-                # blpop blocks until a frame is available
                 keys = await self.redis.keys("queue:frames:*")
                 if not keys:
                     await asyncio.sleep(0.03)
@@ -436,14 +435,12 @@ class PipelineManager:
                 frame_id = notification["frame_id"]
                 frame_number = notification["frame_number"]
 
-                # Read frame bytes from cache
                 cache_key = f"frame:{session_id}:{frame_id}"
                 frame_data = await self.redis.get(cache_key)
                 if not frame_data:
                     logger.warning(f"Frame {frame_id} expired from cache")
                     continue
 
-                # Queue to Kafka
                 task = MediaTask(
                     session_id=session_id,
                     mode=SessionMode.LIVE,
