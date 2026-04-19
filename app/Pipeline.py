@@ -389,7 +389,7 @@ class PipelineManager:
         frame_dets = self._session_predictions[session_id].setdefault(result.frame_number, [])
         bb = result.bbox
         frame_dets.append({
-            "bbox": [float(bb.x), float(bb.y), float(bb.x + bb.w), float(bb.y + bb.h)],
+            "bbox": [int(bb.x), int(bb.y), int(bb.x + bb.w), int(bb.y + bb.h)],
             "predictions": {
                 "emotion":   {"label": result.top_emotion, "confidence": float(result.top_confidence)},
                 "intensity": {"label": intensity_label, "confidence": float(result.intensity)},
