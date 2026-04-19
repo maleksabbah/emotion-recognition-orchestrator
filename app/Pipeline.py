@@ -12,7 +12,10 @@ All database writes go through SessionManager (immediate) or BatchWriter (buffer
 from __future__ import annotations
 import json
 import asyncio
+import base64
 import logging
+import os
+import time
 import uuid
 from typing import Optional
 
@@ -32,10 +35,6 @@ from app.Config import (
     GROUP_ORCHESTRATOR,
 )
 from app.Schemas import (
-    BurnFacePrediction,
-    BurnFramePrediction,
-    BurnSource,
-    BurnTask,
     BurnType,
     FrameSource,
     FrameSourceType,
@@ -86,6 +85,42 @@ def _intensity_label(i: float) -> str:
     return "high"
 
 
+# ──────────────────────────────────────────────
+# S3 helpers (direct boto3; storage service has no raw byte endpoints)
+# ──────────────────────────────────────────────
+def _s3_client():
+    import boto3
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT", "http://minio:9000"),
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY", "minioadmin"),
+        aws_secret_access_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
+    )
+
+
+def _s3_bucket() -> str:
+    return os.getenv("S3_BUCKET", "emotion-recognition")
+
+
+def _s3_download_bytes(key_or_prefix: str) -> bytes:
+    """Download S3 object bytes. If key ends with '/', grab the first object in the prefix."""
+    s3 = _s3_client()
+    bucket = _s3_bucket()
+    actual_key = key_or_prefix
+    if key_or_prefix.endswith("/"):
+        objs = s3.list_objects_v2(Bucket=bucket, Prefix=key_or_prefix, MaxKeys=1)
+        if "Contents" not in objs or not objs["Contents"]:
+            raise ValueError(f"No objects under prefix {key_or_prefix}")
+        actual_key = objs["Contents"][0]["Key"]
+    obj = s3.get_object(Bucket=bucket, Key=actual_key)
+    return obj["Body"].read()
+
+
+def _s3_upload_bytes(key: str, data: bytes, mime: str) -> None:
+    s3 = _s3_client()
+    s3.put_object(Bucket=_s3_bucket(), Key=key, Body=data, ContentType=mime)
+
+
 class PipelineManager:
     def __init__(self, redis_conn: redis.Redis):
         self.redis = redis_conn
@@ -94,8 +129,9 @@ class PipelineManager:
         self.producer: Optional[AIOKafkaProducer] = None
         self._consumers: list = []
         self._tasks: list[asyncio.Task] = []
-        self._session_predictions: dict[str, list[dict]] = {}
-        # Track per-session expected vs received predictions (uploads only)
+        # detections per-session, keyed by frame_number, to build per-frame annotations for burn
+        self._session_predictions: dict[str, dict[int, list[dict]]] = {}
+        # upload bookkeeping
         self._session_expected: dict[str, int] = {}
         self._session_received: dict[str, int] = {}
         self._session_mode: dict[str, str] = {}
@@ -124,7 +160,7 @@ class PipelineManager:
         logger.info("Pipeline manager stopped")
 
     # ══════════════════════════════════════════
-    # ENTRY POINTS (called by API routes)
+    # ENTRY POINTS
     # ══════════════════════════════════════════
 
     async def create_session(self, mode: str, source_s3_key: Optional[str] = None, metadata: Optional[dict] = None):
@@ -159,7 +195,6 @@ class PipelineManager:
     async def submit_upload_job(
         self, session_id: str, mode: SessionMode, s3_key: str, priority: int = 3,
     ) -> None:
-        # Remember the upload's source key + mode so we can queue burn later
         self._session_mode[session_id] = mode.value if hasattr(mode, "value") else str(mode)
         self._session_source_key[session_id] = s3_key
 
@@ -207,7 +242,6 @@ class PipelineManager:
 
         if not result.faces:
             logger.debug(f"Session {session_id} frame {result.frame_number}: no faces")
-            # If an upload returns no faces, nothing to infer → complete immediately
             if session.mode in ("video", "photo"):
                 await self._complete_upload_session(session_id, no_faces=True)
             return
@@ -215,7 +249,6 @@ class PipelineManager:
         async with async_session() as db:
             await self.sessions.increment_counters(db, session_id, frames=1, faces=len(result.faces))
 
-        # For uploads, record how many inference results we expect
         if session.mode in ("video", "photo"):
             self._session_expected[session_id] = (
                 self._session_expected.get(session_id, 0) + len(result.faces)
@@ -337,39 +370,40 @@ class PipelineManager:
         )
         await publish_live(self.redis, session_id, frontend_frame.model_dump())
 
+        # Buffer per-frame detections for burn
         if session_id not in self._session_predictions:
-            self._session_predictions[session_id] = []
-        self._session_predictions[session_id].append({
-            "frame_number": result.frame_number,
-            "timestamp_ms": result.timestamp_ms,
-            "faces": [{"bbox": result.bbox.model_dump(), "top_emotion": result.top_emotion, "top_confidence": result.top_confidence}],
+            self._session_predictions[session_id] = {}
+        frame_dets = self._session_predictions[session_id].setdefault(result.frame_number, [])
+        frame_dets.append({
+            "bbox": result.bbox.model_dump(),
+            "predictions": {
+                "top_emotion": result.top_emotion,
+                "top_confidence": result.top_confidence,
+                "valence": valence_label,
+                "arousal": arousal_label,
+                "intensity": intensity_label,
+            },
         })
 
         await set_job_status(self.redis, session_id, status="processing", current_frame=result.frame_number)
 
-        logger.debug(f"Session {session_id} frame {result.frame_number}: {result.top_emotion} ({result.top_confidence:.2f})")
-
-        # ── Auto-complete uploads ────────────────
+        # Auto-complete uploads once all predictions are in
         mode = self._session_mode.get(session_id)
         if mode in ("video", "photo"):
             self._session_received[session_id] = self._session_received.get(session_id, 0) + 1
             expected = self._session_expected.get(session_id, 0)
             received = self._session_received[session_id]
             if expected and received >= expected:
-                logger.info(
-                    f"Session {session_id} all {expected} predictions in → queuing burn"
-                )
+                logger.info(f"Session {session_id} all {expected} predictions in → queuing burn")
                 await self._complete_upload_session(session_id)
 
     async def _complete_upload_session(self, session_id: str, no_faces: bool = False) -> None:
-        """Finalize a photo/video upload — flush writer, queue burn job."""
         try:
             await self.writer.flush()
         except Exception as e:
             logger.error(f"Flush failed for {session_id}: {e}")
 
         if no_faces:
-            # No faces detected → nothing to burn; mark complete directly
             async with async_session() as db:
                 await self.sessions.update_status(db, session_id, "complete")
             await set_job_status(self.redis, session_id, status="complete", progress=1.0)
@@ -379,15 +413,7 @@ class PipelineManager:
 
         mode = self._session_mode.get(session_id, "video")
         source_key = self._session_source_key.get(session_id, "")
-        burn_type = BurnType.PHOTO if mode == "photo" else BurnType.VIDEO
-        source_type = MediaSourceType.IMAGE if mode == "photo" else MediaSourceType.VIDEO
-
-        await self.queue_burn_job(
-            session_id=session_id,
-            burn_type=burn_type,
-            source_s3_key=source_key,
-            source_type=source_type,
-        )
+        await self._queue_burn_for_upload(session_id, mode, source_key)
 
     def _cleanup_session_state(self, session_id: str) -> None:
         self._session_predictions.pop(session_id, None)
@@ -415,51 +441,108 @@ class PipelineManager:
             pass
 
     async def _handle_burn_result(self, payload: dict) -> None:
-        from app.Schemas import BurnResult
-        result = BurnResult(**payload)
+        """Burner returns {session_id, task_type, status, output_b64, processing_ms, error}.
+        We upload output_b64 to S3 and mark the session complete."""
+        session_id = payload.get("session_id")
+        task_type = payload.get("task_type", "frame")
+        status = payload.get("status")
+        output_b64 = payload.get("output_b64")
+        err = payload.get("error")
+
+        if not session_id:
+            logger.error(f"Burn result missing session_id: {payload}")
+            return
+
+        if status != "success" or not output_b64:
+            logger.error(f"Burn failed for {session_id}: {err}")
+            async with async_session() as db:
+                await self.sessions.update_status(db, session_id, "failed")
+            await set_job_status(self.redis, session_id, status="failed")
+            self._cleanup_session_state(session_id)
+            return
+
+        ext = "jpg" if task_type == "frame" else "mp4"
+        mime = "image/jpeg" if task_type == "frame" else "video/mp4"
+        output_key = f"outputs/burned/{session_id}/annotated.{ext}"
+
+        try:
+            data = base64.b64decode(output_b64)
+            await asyncio.get_event_loop().run_in_executor(
+                None, _s3_upload_bytes, output_key, data, mime
+            )
+        except Exception as e:
+            logger.error(f"Failed to upload burn output for {session_id}: {e}")
+            async with async_session() as db:
+                await self.sessions.update_status(db, session_id, "failed")
+            await set_job_status(self.redis, session_id, status="failed")
+            self._cleanup_session_state(session_id)
+            return
 
         async with async_session() as db:
-            await self.sessions.set_burned_key(db, result.session_id, result.output_s3_key)
-            await self.sessions.update_status(db, result.session_id, "complete")
+            await self.sessions.set_burned_key(db, session_id, output_key)
+            await self.sessions.update_status(db, session_id, "complete")
 
-        await set_job_status(self.redis, result.session_id, status="complete", progress=1.0)
-        self._cleanup_session_state(result.session_id)
-        logger.info(f"Session {result.session_id} complete → {result.output_s3_key}")
+        await set_job_status(self.redis, session_id, status="complete", progress=1.0)
+        self._cleanup_session_state(session_id)
+        logger.info(f"Session {session_id} complete → {output_key}")
 
     # ══════════════════════════════════════════
-    # BURN JOB CREATION
+    # BURN JOB CREATION (matching burner's actual schema)
     # ══════════════════════════════════════════
 
-    async def queue_burn_job(
-        self, session_id: str, burn_type: BurnType,
-        source_s3_key: str = "", source_type: MediaSourceType = MediaSourceType.VIDEO,
-    ) -> None:
-        predictions = self._session_predictions.get(session_id, [])
-        output_ext = "jpg" if burn_type == BurnType.PHOTO else "mp4"
+    async def _queue_burn_for_upload(self, session_id: str, mode: str, source_key: str) -> None:
+        """Build a burn task in the schema the burner expects:
+          photo → {task_type:"frame", frame_b64, detections:[{bbox, predictions}]}
+          video → {task_type:"video", video_b64, frame_annotations:{frame_idx: [detections]}}
+        """
+        try:
+            source_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _s3_download_bytes, source_key
+            )
+        except Exception as e:
+            logger.error(f"Failed to download source {source_key} for burn: {e}")
+            async with async_session() as db:
+                await self.sessions.update_status(db, session_id, "failed")
+            await set_job_status(self.redis, session_id, status="failed")
+            self._cleanup_session_state(session_id)
+            return
 
-        task = BurnTask(
-            session_id=session_id,
-            burn_type=burn_type,
-            source=BurnSource(type=source_type, s3_key=source_s3_key, frame_s3_prefix=f"crops/{session_id}/"),
-            predictions=[
-                BurnFramePrediction(
-                    frame_number=p["frame_number"],
-                    timestamp_ms=p["timestamp_ms"],
-                    faces=[BurnFacePrediction(**f) for f in p["faces"]],
-                ) for p in predictions
-            ],
-            output_s3_key=f"outputs/burned/{session_id}/annotated.{output_ext}",
-        )
+        source_b64 = base64.b64encode(source_bytes).decode("utf-8")
+        preds = self._session_predictions.get(session_id, {})
 
-        await publish(self.producer, TOPIC_BURN_TASKS, task.model_dump(), key=session_id, priority=PRIORITY_BURN)
+        if mode == "photo":
+            # Photo path sent frame_number=0, single frame
+            detections_for_frame = []
+            for _, dets in preds.items():
+                detections_for_frame.extend(dets)
+            task = {
+                "session_id": session_id,
+                "task_type": "frame",
+                "worker_id": "orchestrator",
+                "frame_b64": source_b64,
+                "detections": detections_for_frame,
+            }
+        else:
+            # video
+            frame_annotations = {
+                str(frame_idx): dets for frame_idx, dets in preds.items()
+            }
+            task = {
+                "session_id": session_id,
+                "task_type": "video",
+                "worker_id": "orchestrator",
+                "video_b64": source_b64,
+                "frame_annotations": frame_annotations,
+            }
 
+        await publish(self.producer, TOPIC_BURN_TASKS, task, key=session_id, priority=PRIORITY_BURN)
         async with async_session() as db:
             await self.sessions.update_status(db, session_id, "burning")
         await set_job_status(self.redis, session_id, status="burning")
-        logger.info(f"Session {session_id} → burn queued")
+        logger.info(f"Session {session_id} → burn queued (task_type={task['task_type']})")
 
     # ══════════════════════════════════════════
-    # SESSION LIFECYCLE
+    # LIVE SESSION LIFECYCLE
     # ══════════════════════════════════════════
 
     async def end_live_session(self, session_id: str) -> None:
@@ -471,14 +554,15 @@ class PipelineManager:
         await end_session(self.redis, session_id)
         await self.writer.flush()
 
-        await self.queue_burn_job(
-            session_id=session_id,
-            burn_type=BurnType.LIVE_EXPORT,
-            source_type=MediaSourceType.FRAME_SEQUENCE,
-        )
+        # Live export: we don't have original frames in S3 to burn against,
+        # so mark complete without burning. (Frontend showed frames live.)
+        async with async_session() as db:
+            await self.sessions.update_status(db, session_id, "complete")
+        await set_job_status(self.redis, session_id, status="complete", progress=1.0)
+        self._cleanup_session_state(session_id)
+        logger.info(f"Live session {session_id} complete")
 
     async def _consume_live_frames(self) -> None:
-        """Poll Redis for live frames pushed by the gateway."""
         while True:
             try:
                 keys = await self.redis.keys("queue:frames:*")
