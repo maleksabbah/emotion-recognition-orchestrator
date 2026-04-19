@@ -80,7 +80,7 @@ class PipelineManager:
             asyncio.create_task(self._consume_media_results()),
             asyncio.create_task(self._consume_inference_results()),
             asyncio.create_task(self._consume_burn_results()),
-            asyncio.create_task(self._consume_live_frames()),  # NEW
+            asyncio.create_task(self._consume_live_frames()),
         ]
         logger.info("Pipeline manager started")
 
@@ -155,6 +155,7 @@ class PipelineManager:
                     await consumer.commit()
                 except Exception as e:
                     logger.error(f"Media result error: {e}", exc_info=True)
+                    await consumer.commit()
         except asyncio.CancelledError:
             pass
 
@@ -252,6 +253,7 @@ class PipelineManager:
                     await consumer.commit()
                 except Exception as e:
                     logger.error(f"Inference result error: {e}", exc_info=True)
+                    await consumer.commit()
         except asyncio.CancelledError:
             pass
 
@@ -319,6 +321,7 @@ class PipelineManager:
                     await consumer.commit()
                 except Exception as e:
                     logger.error(f"Burn result error: {e}", exc_info=True)
+                    await consumer.commit()
         except asyncio.CancelledError:
             pass
 
