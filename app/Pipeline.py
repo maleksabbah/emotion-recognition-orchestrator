@@ -376,18 +376,25 @@ class PipelineManager:
         )
         await publish_live(self.redis, session_id, frontend_frame.model_dump())
 
-        # Buffer per-frame detections for burn
+        # Buffer per-frame detections for burn — shape MUST match burner's Overlay.py:
+        #   bbox = [x1, y1, x2, y2]  (list, not dict)
+        #   predictions = {
+        #       "emotion":   {"label": str, "confidence": float},
+        #       "intensity": {"label": str, "confidence": float},
+        #       "valence":   {"label": str, "confidence": float},
+        #       "arousal":   {"label": str, "confidence": float},
+        #   }
         if session_id not in self._session_predictions:
             self._session_predictions[session_id] = {}
         frame_dets = self._session_predictions[session_id].setdefault(result.frame_number, [])
+        bb = result.bbox
         frame_dets.append({
-            "bbox": result.bbox.model_dump(),
+            "bbox": [float(bb.x), float(bb.y), float(bb.x + bb.w), float(bb.y + bb.h)],
             "predictions": {
-                "top_emotion": result.top_emotion,
-                "top_confidence": result.top_confidence,
-                "valence": valence_label,
-                "arousal": arousal_label,
-                "intensity": intensity_label,
+                "emotion":   {"label": result.top_emotion, "confidence": float(result.top_confidence)},
+                "intensity": {"label": intensity_label, "confidence": float(result.intensity)},
+                "valence":   {"label": valence_label, "confidence": float(result.valence)},
+                "arousal":   {"label": arousal_label, "confidence": float(result.arousal)},
             },
         })
 
