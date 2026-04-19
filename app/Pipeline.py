@@ -104,6 +104,12 @@ def _s3_bucket() -> str:
 
 def _s3_download_bytes(key_or_prefix: str) -> bytes:
     """Download S3 object bytes. If key ends with '/', grab the first object in the prefix."""
+    data, _ = _s3_download_bytes_with_key(key_or_prefix)
+    return data
+
+
+def _s3_download_bytes_with_key(key_or_prefix: str) -> tuple[bytes, str]:
+    """Download S3 object and return (bytes, resolved_key)."""
     s3 = _s3_client()
     bucket = _s3_bucket()
     actual_key = key_or_prefix
@@ -113,7 +119,7 @@ def _s3_download_bytes(key_or_prefix: str) -> bytes:
             raise ValueError(f"No objects under prefix {key_or_prefix}")
         actual_key = objs["Contents"][0]["Key"]
     obj = s3.get_object(Bucket=bucket, Key=actual_key)
-    return obj["Body"].read()
+    return obj["Body"].read(), actual_key
 
 
 def _s3_upload_bytes(key: str, data: bytes, mime: str) -> None:
@@ -496,8 +502,8 @@ class PipelineManager:
           video → {task_type:"video", video_b64, frame_annotations:{frame_idx: [detections]}}
         """
         try:
-            source_bytes = await asyncio.get_event_loop().run_in_executor(
-                None, _s3_download_bytes, source_key
+            source_bytes, resolved_key = await asyncio.get_event_loop().run_in_executor(
+                None, _s3_download_bytes_with_key, source_key
             )
         except Exception as e:
             logger.error(f"Failed to download source {source_key} for burn: {e}")
@@ -507,8 +513,16 @@ class PipelineManager:
             self._cleanup_session_state(session_id)
             return
 
+        # Detect photo vs video from the actual file extension (gateway hardcodes mode=video).
+        lower = resolved_key.lower()
+        is_photo = lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"))
+        effective_mode = "photo" if is_photo else "video"
+        if effective_mode != mode:
+            logger.info(f"Session {session_id}: detected {effective_mode} from {resolved_key} (gateway said {mode})")
+
         source_b64 = base64.b64encode(source_bytes).decode("utf-8")
         preds = self._session_predictions.get(session_id, {})
+        mode = effective_mode
 
         if mode == "photo":
             # Photo path sent frame_number=0, single frame
