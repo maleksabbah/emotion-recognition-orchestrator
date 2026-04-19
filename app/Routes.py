@@ -118,7 +118,6 @@ async def submit_upload_job(req: SubmitUploadRequest, request: Request):
 async def presign_upload(req: PresignRequest):
     """Proxy presign request to the storage service (which has S3/MinIO access)."""
     storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
-    s3_public_endpoint = os.getenv("S3_PUBLIC_ENDPOINT", "http://18.175.200.86:9000")
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -134,12 +133,8 @@ async def presign_upload(req: PresignRequest):
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Storage error: {resp.text}")
             data = resp.json()
-
-            # Rewrite internal minio:9000 URL to public endpoint
-            upload_url = data["upload_url"].replace("http://minio:9000", s3_public_endpoint)
-
             return {
-                "upload_url": upload_url,
+                "upload_url": data["upload_url"],
                 "s3_key": data["s3_key"],
             }
     except httpx.RequestError as e:
