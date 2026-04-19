@@ -153,9 +153,9 @@ class InferenceResult(BaseModel):
     emotions: EmotionDistribution
     top_emotion: str
     top_confidence: float
-    valence: str
-    arousal: str
-    intensity: str
+    valence: float
+    arousal: float
+    intensity: float
     inference_time_ms: float
     worker_id: str
 

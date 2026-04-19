@@ -63,6 +63,32 @@ from app.Database import async_session
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────
+# Float → label converters (for FrontendFace)
+# ──────────────────────────────────────────────
+def _valence_label(v: float) -> str:
+    """Map valence score to a categorical label."""
+    if v < 0.4:
+        return "negative"
+    if v < 0.6:
+        return "neutral"
+    return "positive"
+
+
+def _arousal_label(a: float) -> str:
+    """Map arousal score to a categorical label."""
+    return "high" if a >= 0.5 else "low"
+
+
+def _intensity_label(i: float) -> str:
+    """Map intensity score to a categorical label."""
+    if i < 0.34:
+        return "low"
+    if i < 0.67:
+        return "medium"
+    return "high"
+
+
 class PipelineManager:
     def __init__(self, redis_conn: redis.Redis):
         self.redis = redis_conn
@@ -261,7 +287,7 @@ class PipelineManager:
         result = InferenceResult(**payload)
         session_id = result.session_id
 
-        # Log prediction to PostgreSQL (batched)
+        # Log prediction to PostgreSQL (batched) — keep raw floats here
         await self.writer.add_prediction(
             detection_id=result.detection_id,
             emotions=result.emotions.model_dump(),
@@ -275,6 +301,8 @@ class PipelineManager:
         )
 
         # Build and publish frontend payload via Redis
+        # FrontendFace expects STRING labels for valence/arousal/intensity,
+        # so convert the raw floats from InferenceResult.
         frontend_frame = FrontendFrame(
             session_id=session_id,
             frame_number=result.frame_number,
@@ -286,9 +314,9 @@ class PipelineManager:
                 top_emotion=result.top_emotion,
                 top_confidence=result.top_confidence,
                 emotions=result.emotions,
-                valence=result.valence,
-                arousal=result.arousal,
-                intensity=result.intensity,
+                valence=_valence_label(result.valence),
+                arousal=_arousal_label(result.arousal),
+                intensity=_intensity_label(result.intensity),
             )],
         )
         await publish_live(self.redis, session_id, frontend_frame.model_dump())
