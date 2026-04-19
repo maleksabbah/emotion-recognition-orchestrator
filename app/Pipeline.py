@@ -223,7 +223,12 @@ class PipelineManager:
             )
 
             # Save crops to S3 (async, non-blocking)
-            asyncio.create_task(self._save_crops(session_id, detection_id, result.frame_number, s3_prefix, face))
+            asyncio.create_task(self._save_crops(
+                session_id=session_id,
+                frame_number=result.frame_number,
+                face_index=face.face_index,
+                face=face,
+            ))
 
             # Queue inference
             inference_task = InferenceTask(
@@ -241,16 +246,25 @@ class PipelineManager:
 
         logger.debug(f"Session {session_id} frame {result.frame_number}: {len(result.faces)} faces → inference")
 
-    async def _save_crops(self, session_id: str, detection_id: str, frame_number: int, s3_prefix: str, face) -> None:
+    async def _save_crops(
+        self, session_id: str, frame_number: int, face_index: int, face,
+    ) -> None:
+        """Call storage service /internal/save-crops.
+
+        Storage's SaveCropsRequest expects:
+          - session_id (str)
+          - frame_index (int)
+          - detection_index (int)   ← we use face_index as the per-frame detection index
+          - crops (dict[str, str])  ← base64 JPEGs
+        """
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 await client.post(
                     f"{STORAGE_SERVICE_URL}/internal/save-crops",
                     json={
                         "session_id": session_id,
-                        "detection_id": detection_id,
-                        "frame_number": frame_number,
-                        "s3_prefix": s3_prefix,
+                        "frame_index": frame_number,
+                        "detection_index": face_index,
                         "crops": {
                             "face": face.face_crop,
                             "eyes": face.region_crops.eyes,
@@ -261,7 +275,7 @@ class PipelineManager:
                     },
                 )
         except Exception as e:
-            logger.error(f"Crop save failed for {s3_prefix}: {e}")
+            logger.error(f"Crop save failed for session={session_id} frame={frame_number}: {e}")
 
     # ══════════════════════════════════════════
     # STAGE 2: Inference Worker → Orchestrator → Frontend + Burn
