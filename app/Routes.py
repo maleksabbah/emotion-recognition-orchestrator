@@ -1,6 +1,9 @@
 """
 Orchestrator API routes.
-Gateway calls these to create sessions, submit frames, check status.
+Gateway calls these to create sessions, submit frames, check status, download output.
+
+The orchestrator owns session state but never touches MinIO or the storage DB
+directly. For any file operation it calls the storage service over HTTP.
 """
 from __future__ import annotations
 
@@ -23,6 +26,8 @@ from app.Schemas import (
 from app.Redis import get_job_status
 
 router = APIRouter()
+
+STORAGE_SERVICE_URL = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
 
 
 # ── Request / Response models ────────────────
@@ -58,10 +63,6 @@ class PresignRequest(BaseModel):
     content_type: str
 
 
-class PresignDownloadRequest(BaseModel):
-    file_id: str
-
-
 # ── Routes ───────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse)
@@ -80,7 +81,6 @@ async def create_session(req: CreateSessionRequest, request: Request):
     if req.mode == SessionMode.LIVE:
         from app.Redis import register_session
         await register_session(pipeline.redis, str(session.id), req.metadata)
-
     return CreateSessionResponse(
         session_id=str(session.id),
         mode=req.mode,
@@ -95,7 +95,6 @@ async def submit_frame(req: SubmitFrameRequest, request: Request):
         frame_data = base64.b64decode(req.frame_data)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 frame data")
-
     frame_id = await pipeline.submit_live_frame(
         session_id=req.session_id,
         frame_data=frame_data,
@@ -120,17 +119,12 @@ async def submit_upload_job(req: SubmitUploadRequest, request: Request):
 
 @router.post("/upload/presign")
 async def presign_upload(req: PresignRequest):
-    """Proxy presign request to the storage service.
-
-    Storage service already returns browser-reachable URLs (it signs with
-    S3_PUBLIC_ENDPOINT), so we just pass them through.
-    """
-    storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
-
+    """Proxy to storage. Storage signs with the public endpoint, so the URL
+    it returns is already browser-reachable — no rewriting here."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{storage_url}/internal/presign/upload",
+                f"{STORAGE_SERVICE_URL}/internal/presign/upload",
                 json={
                     "session_id": req.session_id,
                     "file_type": "source",
@@ -141,11 +135,7 @@ async def presign_upload(req: PresignRequest):
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Storage error: {resp.text}")
             data = resp.json()
-
-            return {
-                "upload_url": data["upload_url"],
-                "s3_key": data["s3_key"],
-            }
+            return {"upload_url": data["upload_url"], "s3_key": data["s3_key"]}
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Storage unreachable: {e}")
 
@@ -153,8 +143,6 @@ async def presign_upload(req: PresignRequest):
 @router.get("/sessions/{session_id}/status", response_model=JobStatusResponse)
 async def get_session_status(session_id: str, request: Request):
     pipeline = request.app.state.pipeline
-
-    # Redis first (fast path for active jobs)
     status = await get_job_status(pipeline.redis, session_id)
     if status:
         return JobStatusResponse(
@@ -166,11 +154,9 @@ async def get_session_status(session_id: str, request: Request):
             eta_seconds=float(status["eta_seconds"]) if "eta_seconds" in status else None,
         )
 
-    # Fall back to PostgreSQL
     session = await pipeline.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
     return JobStatusResponse(
         session_id=session_id,
         status=SessionStatus(session.status),
@@ -180,53 +166,48 @@ async def get_session_status(session_id: str, request: Request):
 
 @router.get("/sessions/{session_id}/download")
 async def get_session_download(session_id: str, request: Request):
-    """Return a presigned download URL for the session's burned output.
+    """Look up the burned file via storage and return a presigned URL.
 
-    Delegates the signing to the storage service, which uses the public endpoint.
+    Storage is the single source of truth for what's in MinIO. We query it
+    and delegate presigning — orchestrator never touches S3.
     """
     pipeline = request.app.state.pipeline
     session = await pipeline.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
     if not session.burned_s3_key:
         raise HTTPException(status_code=404, detail="No burned output yet")
 
-    # Register the burned file with storage service, then ask it to presign.
-    storage_url = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
-    file_type = "video" if session.burned_s3_key.lower().endswith(".mp4") else "image"
-    mime_type = "video/mp4" if file_type == "video" else "image/jpeg"
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Register (idempotent-ish — if it already exists storage will still return a usable record)
-            reg = await client.post(
-                f"{storage_url}/internal/register",
-                json={
-                    "session_id": session_id,
-                    "category": "burned",
-                    "file_type": file_type,
-                    "s3_key": session.burned_s3_key,
-                    "mime_type": mime_type,
-                },
+            lookup = await client.get(
+                f"{STORAGE_SERVICE_URL}/internal/files",
+                params={"session_id": session_id, "category": "burned"},
             )
-            if reg.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Storage register error: {reg.text}")
-            file_id = reg.json()["id"]
+            if lookup.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Storage lookup error: {lookup.text}")
+            files = lookup.json()
+            if not files:
+                raise HTTPException(status_code=404, detail="Burned file not registered")
+            record = files[0]
 
-            # Ask storage to presign a download
             pres = await client.post(
-                f"{storage_url}/internal/presign/download",
-                json={"file_id": file_id},
+                f"{STORAGE_SERVICE_URL}/internal/presign/download",
+                json={"file_id": record["id"]},
             )
             if pres.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Storage presign error: {pres.text}")
             data = pres.json()
 
+            s3_key = record["s3_key"]
+            file_type = "video" if s3_key.lower().endswith(".mp4") else "image"
+            filename = s3_key.rsplit("/", 1)[-1]
+
             return {
                 "download_url": data["download_url"],
-                "s3_key": session.burned_s3_key,
+                "s3_key": s3_key,
                 "file_type": file_type,
+                "filename": filename,
             }
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Storage unreachable: {e}")
