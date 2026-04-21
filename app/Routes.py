@@ -18,7 +18,6 @@ from typing import Optional
 from app.Schemas import (
     BurnType,
     HealthResponse,
-    JobStatusResponse,
     MediaSourceType,
     SessionMode,
     SessionStatus,
@@ -120,7 +119,7 @@ async def submit_upload_job(req: SubmitUploadRequest, request: Request):
 @router.post("/upload/presign")
 async def presign_upload(req: PresignRequest):
     """Proxy to storage. Storage signs with the public endpoint, so the URL
-    it returns is already browser-reachable — no rewriting here."""
+    it returns is already browser-reachable - no rewriting here."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -140,28 +139,37 @@ async def presign_upload(req: PresignRequest):
         raise HTTPException(status_code=502, detail=f"Storage unreachable: {e}")
 
 
-@router.get("/sessions/{session_id}/status", response_model=JobStatusResponse)
+@router.get("/sessions/{session_id}/status")
 async def get_session_status(session_id: str, request: Request):
+    """Session status. Returns progress-related fields plus counters from the
+    session row so the frontend can render a result summary on completion.
+    """
     pipeline = request.app.state.pipeline
-    status = await get_job_status(pipeline.redis, session_id)
-    if status:
-        return JobStatusResponse(
-            session_id=session_id,
-            status=SessionStatus(status.get("status", "processing")),
-            progress=float(status.get("progress", 0.0)),
-            total_frames=int(status.get("total_frames", 0)),
-            current_frame=int(status.get("current_frame", 0)),
-            eta_seconds=float(status["eta_seconds"]) if "eta_seconds" in status else None,
-        )
 
+    # Load persisted row for counters / final status
     session = await pipeline.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return JobStatusResponse(
-        session_id=session_id,
-        status=SessionStatus(session.status),
-        total_frames=session.total_frames,
-    )
+
+    # Redis holds live progress during active processing
+    live = await get_job_status(pipeline.redis, session_id)
+
+    status = (live or {}).get("status", session.status)
+    progress = float((live or {}).get("progress", 1.0 if session.status == "complete" else 0.0))
+    current_frame = int((live or {}).get("current_frame", 0))
+    total_frames = int((live or {}).get("total_frames", 0)) or int(session.total_frames or 0)
+    eta = (live or {}).get("eta_seconds")
+
+    return {
+        "session_id": session_id,
+        "status": status,
+        "progress": progress,
+        "current_frame": current_frame,
+        "total_frames": total_frames,
+        "total_faces": int(session.total_faces or 0),
+        "mode": session.mode,
+        "eta_seconds": float(eta) if eta is not None else None,
+    }
 
 
 @router.get("/sessions/{session_id}/download")
@@ -169,7 +177,7 @@ async def get_session_download(session_id: str, request: Request):
     """Look up the burned file via storage and return a presigned URL.
 
     Storage is the single source of truth for what's in MinIO. We query it
-    and delegate presigning — orchestrator never touches S3.
+    and delegate presigning - orchestrator never touches S3.
     """
     pipeline = request.app.state.pipeline
     session = await pipeline.get_session(session_id)
