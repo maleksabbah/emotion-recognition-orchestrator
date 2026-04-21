@@ -85,8 +85,29 @@ def _intensity_label(i: float) -> str:
 
 
 def _ext_for(source_key: str) -> tuple[str, str, str]:
-    """Given a source key, return (task_type, output_ext, output_mime)."""
+    """Given a source key (file or prefix), return (task_type, output_ext, output_mime).
+
+    If the key ends with '/', we need to look inside — so we list the prefix
+    in MinIO and use the first actual object's extension.
+    """
     lower = source_key.lower()
+    if lower.endswith("/") or "." not in lower.rsplit("/", 1)[-1]:
+        # Prefix — peek inside
+        try:
+            import boto3
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=os.getenv("S3_ENDPOINT", "http://minio:9000"),
+                aws_access_key_id=os.getenv("S3_ACCESS_KEY", "minioadmin"),
+                aws_secret_access_key=os.getenv("S3_SECRET_KEY", "minioadmin"),
+            )
+            bucket = os.getenv("S3_BUCKET", "emotion-recognition")
+            objs = s3.list_objects_v2(Bucket=bucket, Prefix=source_key, MaxKeys=1)
+            if "Contents" in objs and objs["Contents"]:
+                lower = objs["Contents"][0]["Key"].lower()
+        except Exception:
+            pass
+
     if lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")):
         return "frame", "jpg", "image/jpeg"
     return "video", "mp4", "video/mp4"
