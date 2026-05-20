@@ -1,6 +1,6 @@
 # EmotionRecognitionOrchestrator
-# FastAPI: pipeline brain, Kafka pub/sub, Redis streams, PostgreSQL
-# Talks to: Kafka, Redis, PostgreSQL (orchestrator_db), Storage Service (HTTP)
+# FastAPI: pipeline brain, WebSocket terminator, Kafka pub/sub, Redis streams
+# Talks to: Kafka, Redis, PostgreSQL (orchestrator_db), Storage (HTTP)
 # Port: 8001
 
 FROM python:3.11-slim
@@ -9,6 +9,8 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    build-essential \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -19,5 +21,5 @@ COPY main.py .
 
 EXPOSE 8001
 
-# Single worker — orchestrator manages stateful pipeline
+# Single worker — orchestrator owns stateful Kafka consumers + WebSocket sessions
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
