@@ -46,13 +46,21 @@ class JobService:
 
     async def start_upload_job(self, req: UploadJobRequest) -> UploadJobResponse:
         """
-        Upload finished — publish a MediaTask for the source file. The media
-        worker picks it up, downloads from MinIO, detects faces, etc.
+        Upload finished:
+          1. Persist the real s3_key on the Job row so the burner can fetch
+             the source file later. Without this, BurnTask.source_s3_key is
+             None and the burner crashes with NoSuchKey.
+          2. Publish a MediaTask so the media worker starts processing.
+          3. Move the session into 'processing'.
         """
         job = await self.jobs.find_by_id(req.session_id)
         if not job:
             raise NotFound()
 
+        # 1. Persist the real S3 key on the session row.
+        await self.jobs.set_source_s3_key(req.session_id, req.s3_key)
+
+        # 2. Publish MediaTask — media worker pulls source from S3 by this key.
         task = MediaTask(
             task_id=str(uuid.uuid4()),
             session_id=req.session_id,
@@ -62,6 +70,7 @@ class JobService:
         )
         await self.producer.publish_media_task(task.model_dump())
 
+        # 3. Status flips to processing for the frontend's progress bar.
         await self.jobs.update_status(req.session_id, "processing")
         return UploadJobResponse(status="queued", session_id=req.session_id)
 
@@ -86,9 +95,9 @@ class JobService:
         if not job:
             raise NotFound()
 
-        # Simple progress heuristic. Live + photo are single-frame, so we report
-        # 100% when status=complete; video tracks frames_done/total_frames once
-        # the burner has emitted progress (not modelled here yet).
+        # Simple progress heuristic. Live + photo are single-frame, so we
+        # report 100% when status=complete; video tracks frames_done/total
+        # once the burner emits per-frame progress (not modelled here yet).
         progress = 1.0 if job.status == "complete" else 0.0
         return JobStatusResponse(
             session_id=str(job.id),
