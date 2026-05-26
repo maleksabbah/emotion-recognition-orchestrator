@@ -7,6 +7,11 @@ producer) lives on app.state from main.py's lifespan.
 
 Auth here is JWT-decode-only: orchestrator doesn't have a users table.
 The gateway is the issuer; orchestrator only validates and reads `sub`.
+
+Shared infra getters take `HTTPConnection` (the common parent of `Request`
+and `WebSocket`), so the same dependency chain works for both HTTP routes
+and the /ws/live WebSocket route. Using `Request` here breaks WS endpoints
+because FastAPI injects a `WebSocket` for those, not a `Request`.
 """
 from __future__ import annotations
 
@@ -15,7 +20,8 @@ from typing import AsyncIterator
 import httpx
 import redis.asyncio as redis
 from aiokafka import AIOKafkaProducer
-from fastapi import Depends, Request
+from fastapi import Depends
+from starlette.requests import HTTPConnection
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.Config.Database import SessionLocal
@@ -47,17 +53,19 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
 
 
 # ─── Shared infra from app.state ───────────────────────────────────────
+# HTTPConnection is the common parent of fastapi.Request and fastapi.WebSocket,
+# so the same dep works for both HTTP routes and WS handlers.
 
-def get_http_client(request: Request) -> httpx.AsyncClient:
-    return request.app.state.http_client
-
-
-def get_redis_conn(request: Request) -> redis.Redis:
-    return request.app.state.redis
+def get_http_client(conn: HTTPConnection) -> httpx.AsyncClient:
+    return conn.app.state.http_client
 
 
-def get_kafka_producer(request: Request) -> AIOKafkaProducer:
-    return request.app.state.kafka_producer
+def get_redis_conn(conn: HTTPConnection) -> redis.Redis:
+    return conn.app.state.redis
+
+
+def get_kafka_producer(conn: HTTPConnection) -> AIOKafkaProducer:
+    return conn.app.state.kafka_producer
 
 
 # ─── Repositories ──────────────────────────────────────────────────────
