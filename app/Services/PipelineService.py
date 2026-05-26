@@ -7,6 +7,12 @@ One method per result topic. Each handler is top-down:
 Crops are persisted by the MEDIA WORKER (which calls storage directly).
 This service just reads back the s3_keys from MediaResult and writes the
 CropRecord rows that link them to detections.
+
+The full chain:
+  media_result   → detections + crops + INFERENCE TASKS published
+  inference_result → prediction persisted; if all faces for this session
+                     now have predictions, the BURN TASK is published
+  burn_result    → session marked complete (or failed)
 """
 from __future__ import annotations
 
@@ -14,9 +20,10 @@ import logging
 import uuid
 
 from app.Dtos.TaskDto.BurnResult import BurnResult
+from app.Dtos.TaskDto.BurnTask import BurnFacePrediction, BurnFrame, BurnTask
 from app.Dtos.TaskDto.InferenceResult import InferenceResult
 from app.Dtos.TaskDto.InferenceTask import InferenceTask
-from app.Dtos.TaskDto.MediaResult import MediaResult
+from app.Dtos.TaskDto.MediaResult import Bbox, MediaResult
 from app.Entities.CropRecord import CropRecord
 from app.Entities.Detection import Detection
 from app.Entities.Prediction import Prediction
@@ -155,6 +162,7 @@ class PipelineService:
         )
         await self.predictions.create(prediction)
 
+        # Live mode → push to Redis pub/sub for WS subscribers
         if job.mode == "live":
             await self.redis.publish_live_result(
                 result.session_id,
@@ -168,6 +176,14 @@ class PipelineService:
                     "intensity": result.intensity,
                 },
             )
+            # Live sessions never burn — each frame is shipped as it lands.
+            return
+
+        # Batch mode (photo / video) → when every detection for the session
+        # has a prediction, fan out the burn task. We check this every time
+        # because messages arrive out-of-order; only the last one will see
+        # the counts match.
+        await self._maybe_publish_burn(result.session_id, job)
 
     # ══════════════════════════════════════════
     # burn_results topic
@@ -200,7 +216,78 @@ class PipelineService:
                 return r.id
         return None
 
+    async def _maybe_publish_burn(self, session_id: str, job) -> None:
+        """
+        Publish a BurnTask only when every detection has a prediction.
 
+        We rebuild the full per-frame prediction map from DB rather than
+        accumulating in memory — the orchestrator may be horizontally
+        scaled, and DB is the only shared source of truth.
+        """
+        dets = await self.detections.list_for_session(session_id)
+        if not dets:
+            return
+
+        # Collect predictions per detection_id (one row per detection)
+        det_to_pred: dict[uuid.UUID, Prediction] = {}
+        for det in dets:
+            pred = await self.predictions.find_for_detection(det.id)
+            if pred is None:
+                # Not all predictions are in yet; another invocation will finish.
+                return
+            det_to_pred[det.id] = pred
+
+        # Source key — required by the burner to download the original file.
+        # Falls back to a best-effort default if absent so we still attempt
+        # something rather than dropping silently.
+        source_key = getattr(job, "source_s3_key", None)
+        if not source_key:
+            logger.warning(
+                "No source_s3_key on session %s; burn task will likely fail",
+                session_id,
+            )
+            source_key = f"sessions/{session_id}/source/unknown"
+
+        # Group detections by frame
+        frames_map: dict[int, list[tuple[Detection, Prediction]]] = {}
+        for det in dets:
+            frames_map.setdefault(det.frame_number, []).append(
+                (det, det_to_pred[det.id])
+            )
+
+        frames: list[BurnFrame] = []
+        for frame_number in sorted(frames_map.keys()):
+            preds: list[BurnFacePrediction] = []
+            ts_ms = 0.0
+            for det, pred in frames_map[frame_number]:
+                ts_ms = float(det.timestamp_ms or 0.0)
+                preds.append(BurnFacePrediction(
+                    bbox=Bbox(x=det.bbox_x, y=det.bbox_y, w=det.bbox_w, h=det.bbox_h),
+                    top_emotion=pred.top_emotion,
+                    top_confidence=float(pred.top_confidence),
+                    valence=pred.valence,
+                    arousal=pred.arousal,
+                    intensity=pred.intensity,
+                ))
+            frames.append(BurnFrame(
+                frame_number=frame_number,
+                timestamp_ms=ts_ms,
+                predictions=preds,
+            ))
+
+        task = BurnTask(
+            task_id=str(uuid.uuid4()),
+            session_id=session_id,
+            mode=job.mode,  # "video" or "photo"
+            source_s3_key=source_key,
+            frames=frames,
+        )
+        await self.producer.publish_burn_task(task.model_dump())
+        await self.jobs.update_status(session_id, "burning")
+        logger.info(
+            "Published BurnTask for session %s (%d frames, %d total preds)",
+            session_id, len(frames), sum(len(f.predictions) for f in frames),
+        )
 
 
 
