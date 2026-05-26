@@ -2,8 +2,8 @@
 Orchestrator entry point.
 
 Builds the FastAPI app with:
-  - Lifespan: creates httpx client, Redis connection, Kafka producer,
-              spawns 3 Kafka consumer loops (media/inference/burn results)
+  - Lifespan: ensures schema, creates httpx client, Redis connection,
+              Kafka producer, spawns 3 Kafka consumer loops
   - CORS, exception handlers
   - Routes: /health, /api/sessions*, /ws/live
 
@@ -26,10 +26,14 @@ from app.Config import (
     INFERENCE_RESULTS_TOPIC,
     MEDIA_RESULTS_TOPIC,
     SessionLocal,
+    engine,
     get_producer,
     get_redis,
     make_consumer,
 )
+# Import the Entities package — this registers every model on Base.metadata
+# so create_all sees the full table set, not just the few that Routes touch.
+from app.Entities import Base  # noqa: F401  (side-effect import)
 from app.Exceptions import register_exception_handlers
 from app.Repositories.CropRecordRepository import CropRecordRepository
 from app.Repositories.DetectionRepository import DetectionRepository
@@ -100,6 +104,15 @@ async def _build_pipeline_per_message(message: dict, topic: str, app: FastAPI) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting orchestrator...")
+
+    # Ensure schema exists. Idempotent — create_all only creates missing
+    # tables and types, so this is safe to run on every boot. Without this,
+    # any model added after the first deploy (e.g. CropRecord) silently
+    # has no table, and handle_media_result crashes on INSERT, killing the
+    # pipeline before publish_inference_task can run.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Schema ensured")
 
     # Shared infra
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
