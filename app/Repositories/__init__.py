@@ -5,7 +5,7 @@ DB-backed:        JobRepository, DetectionRepository,
                   PredictionRepository, CropRecordRepository
 Redis-backed:     RedisRepository
 HTTP-backed:      StorageClient
-Kafka-backed:     KafkaProducer, KafkaConsumer
+Kafka-backed:     KafkaProducer
 """
 from app.Repositories.JobRepository import JobRepository
 from app.Repositories.DetectionRepository import DetectionRepository
@@ -14,7 +14,6 @@ from app.Repositories.CropRecordRepository import CropRecordRepository
 from app.Repositories.RedisRepository import RedisRepository
 from app.Repositories.StorageClient import StorageClient
 from app.Repositories.KafkaProducer import KafkaProducer
-from app.Repositories.KafkaConsumer import KafkaConsumer
 
 __all__ = [
     "JobRepository",
@@ -24,5 +23,4 @@ __all__ = [
     "RedisRepository",
     "StorageClient",
     "KafkaProducer",
-    "KafkaConsumer",
 ]

@@ -19,6 +19,22 @@ class DetectionRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def find_by_frame_and_face(
+        self,
+        session_id: str | uuid.UUID,
+        frame_number: int,
+        face_index: int,
+    ) -> Detection | None:
+        uid = _as_uuid(session_id)
+        result = await self.db.execute(
+            select(Detection).where(
+                Detection.session_id == uid,
+                Detection.frame_number == frame_number,
+                Detection.face_index == face_index,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def list_for_session(self, session_id: str | uuid.UUID) -> list[Detection]:
         uid = _as_uuid(session_id)
         result = await self.db.execute(
@@ -30,13 +46,13 @@ class DetectionRepository:
 
     async def create(self, detection: Detection) -> Detection:
         self.db.add(detection)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(detection)
         return detection
 
     async def create_many(self, detections: Iterable[Detection]) -> None:
         self.db.add_all(list(detections))
-        await self.db.commit()
+        await self.db.flush()
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

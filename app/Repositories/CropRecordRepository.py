@@ -30,7 +30,7 @@ class CropRecordRepository:
 
     async def create_many(self, records: Iterable[CropRecord]) -> None:
         self.db.add_all(list(records))
-        await self.db.commit()
+        await self.db.flush()
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

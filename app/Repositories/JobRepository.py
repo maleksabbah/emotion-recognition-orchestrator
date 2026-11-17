@@ -26,10 +26,12 @@ class JobRepository:
         result = await self.db.execute(select(Job).where(Job.id == uid))
         return result.scalar_one_or_none()
 
-    async def list_all(self, limit: int = 100) -> list[Job]:
-        result = await self.db.execute(
-            select(Job).order_by(Job.created_at.desc()).limit(limit)
-        )
+    async def list_all(self, limit: int = 100, user_id: str | None = None) -> list[Job]:
+        stmt = select(Job)
+        if user_id:
+            stmt = stmt.where(Job.metadata_["user_id"].astext == user_id)
+        stmt = stmt.order_by(Job.created_at.desc()).limit(limit)
+        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
     # ── Writes ───────────────────────────────────────
@@ -46,7 +48,7 @@ class JobRepository:
             source_s3_key=source_s3_key,
         )
         self.db.add(job)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(job)
         return job
 
@@ -55,7 +57,6 @@ class JobRepository:
         await self.db.execute(
             update(Job).where(Job.id == uid).values(status=status)
         )
-        await self.db.commit()
 
     async def set_source_s3_key(
         self, job_id: str | uuid.UUID, source_s3_key: str
@@ -68,7 +69,6 @@ class JobRepository:
         await self.db.execute(
             update(Job).where(Job.id == uid).values(source_s3_key=source_s3_key)
         )
-        await self.db.commit()
 
     async def mark_complete(
         self,
@@ -90,7 +90,19 @@ class JobRepository:
         if burned_s3_key is not None:
             values["burned_s3_key"] = burned_s3_key
         await self.db.execute(update(Job).where(Job.id == uid).values(**values))
-        await self.db.commit()
+
+    async def try_set_burning(self, job_id: str | uuid.UUID) -> bool:
+        """
+        Atomically set status='burning' only if not already 'burning'.
+        Returns True if the row was updated (we won the race), False otherwise.
+        """
+        uid = _as_uuid(job_id)
+        result = await self.db.execute(
+            update(Job)
+            .where(Job.id == uid, Job.status != "burning")
+            .values(status="burning")
+        )
+        return result.rowcount > 0
 
     async def increment_counters(
         self,
@@ -107,7 +119,6 @@ class JobRepository:
                 total_faces=Job.total_faces + faces,
             )
         )
-        await self.db.commit()
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

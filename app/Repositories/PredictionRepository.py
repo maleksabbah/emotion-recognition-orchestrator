@@ -28,15 +28,26 @@ class PredictionRepository:
         )
         return result.scalar_one_or_none()
 
+    async def find_for_detections(
+        self, detection_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, Prediction]:
+        """Batch-fetch predictions for multiple detection IDs in one query."""
+        if not detection_ids:
+            return {}
+        result = await self.db.execute(
+            select(Prediction).where(Prediction.detection_id.in_(detection_ids))
+        )
+        return {p.detection_id: p for p in result.scalars().all()}
+
     async def create(self, prediction: Prediction) -> Prediction:
         self.db.add(prediction)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(prediction)
         return prediction
 
     async def create_many(self, predictions: Iterable[Prediction]) -> None:
         self.db.add_all(list(predictions))
-        await self.db.commit()
+        await self.db.flush()
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

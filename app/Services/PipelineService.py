@@ -210,11 +210,10 @@ class PipelineService:
     async def _find_detection_id(
         self, session_id: str, frame_number: int, face_index: int
     ):
-        rows = await self.detections.list_for_session(session_id)
-        for r in rows:
-            if r.frame_number == frame_number and r.face_index == face_index:
-                return r.id
-        return None
+        det = await self.detections.find_by_frame_and_face(
+            session_id, frame_number, face_index
+        )
+        return det.id if det else None
 
     async def _maybe_publish_burn(self, session_id: str, job) -> None:
         """
@@ -228,14 +227,13 @@ class PipelineService:
         if not dets:
             return
 
-        # Collect predictions per detection_id (one row per detection)
-        det_to_pred: dict[uuid.UUID, Prediction] = {}
-        for det in dets:
-            pred = await self.predictions.find_for_detection(det.id)
-            if pred is None:
-                # Not all predictions are in yet; another invocation will finish.
-                return
-            det_to_pred[det.id] = pred
+        # Batch-fetch all predictions in one query instead of N+1
+        det_ids = [det.id for det in dets]
+        det_to_pred = await self.predictions.find_for_detections(det_ids)
+
+        # Not all predictions are in yet; another invocation will finish
+        if len(det_to_pred) < len(dets):
+            return
 
         # Source key — required by the burner to download the original file.
         # Falls back to a best-effort default if absent so we still attempt
@@ -282,8 +280,12 @@ class PipelineService:
             source_s3_key=source_key,
             frames=frames,
         )
+        # Atomically claim the burn — only one inference_result handler wins
+        if not await self.jobs.try_set_burning(session_id):
+            logger.info("Burn already claimed for session %s, skipping", session_id)
+            return
+
         await self.producer.publish_burn_task(task.model_dump())
-        await self.jobs.update_status(session_id, "burning")
         logger.info(
             "Published BurnTask for session %s (%d frames, %d total preds)",
             session_id, len(frames), sum(len(f.predictions) for f in frames),

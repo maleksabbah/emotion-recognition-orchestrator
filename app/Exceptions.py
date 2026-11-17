@@ -103,5 +103,15 @@ async def domain_exception_handler(
     )
 
 
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all for unhandled exceptions — log the traceback, return 500."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DomainException, domain_exception_handler)
+    app.add_exception_handler(Exception, generic_exception_handler)

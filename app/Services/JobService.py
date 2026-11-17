@@ -86,13 +86,15 @@ class JobService:
     # Reads
     # ══════════════════════════════════════════
 
-    async def list_jobs(self, limit: int = 100) -> list[JobResponse]:
-        rows = await self.jobs.list_all(limit=limit)
+    async def list_jobs(self, limit: int = 100, user_id: str | None = None) -> list[JobResponse]:
+        rows = await self.jobs.list_all(limit=limit, user_id=user_id)
         return [self._to_response(j) for j in rows]
 
-    async def get_status(self, session_id: str) -> JobStatusResponse:
+    async def get_status(self, session_id: str, user_id: str | None = None) -> JobStatusResponse:
         job = await self.jobs.find_by_id(session_id)
         if not job:
+            raise NotFound()
+        if user_id and job.metadata_.get("user_id") != user_id:
             raise NotFound()
 
         # Simple progress heuristic. Live + photo are single-frame, so we

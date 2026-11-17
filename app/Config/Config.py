@@ -12,7 +12,7 @@ import os
 
 # ─── JWT / Auth (shared with gateway) ──────────────────────────────────
 
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret-change-in-production")
+JWT_SECRET = os.environ["JWT_SECRET_KEY"]
 JWT_ALGORITHM = "HS256"
 
 
@@ -21,9 +21,9 @@ JWT_ALGORITHM = "HS256"
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "emotion")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "emotion_dev")
+POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 ORCHESTRATOR_DB = os.getenv("ORCHESTRATOR_DB", "orchestrator_db")
-ORCHESTRATOR_DB_URL = (
+ORCHESTRATOR_DB_URL = os.getenv("DATABASE_URL") or (
     f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
     f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{ORCHESTRATOR_DB}"
 )
@@ -44,6 +44,8 @@ STORAGE_SERVICE_URL = os.getenv("STORAGE_SERVICE_URL", "http://storage:8002")
 # ─── Kafka (batch flow only) ──────────────────────────────────────────
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 ORCHESTRATOR_GROUP_ID = os.getenv("ORCHESTRATOR_GROUP_ID", "orchestrator")
 
 MEDIA_TASKS_TOPIC = os.getenv("MEDIA_TASKS_TOPIC", "media_tasks")

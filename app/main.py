@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import httpx
@@ -66,11 +67,13 @@ async def _consume(topic: str, handler) -> None:
                 msg = json.loads(record.value.decode("utf-8"))
             except json.JSONDecodeError as e:
                 logger.error("Bad JSON from %s: %s", topic, e)
+                await consumer.commit()
                 continue
             try:
                 await handler(msg)
             except Exception:
                 logger.exception("handler failed on %s", topic)
+            await consumer.commit()
     finally:
         await consumer.stop()
 
@@ -157,10 +160,15 @@ async def lifespan(app: FastAPI):
 
 # ─── App ──────────────────────────────────────────────────────────────
 
+_DEV = os.getenv("ENV", "production") != "production"
+
 app = FastAPI(
     title="Emotion Recognition Orchestrator",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if _DEV else None,
+    redoc_url="/redoc" if _DEV else None,
+    openapi_url="/openapi.json" if _DEV else None,
 )
 
 app.add_middleware(
