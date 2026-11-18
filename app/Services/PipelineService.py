@@ -10,8 +10,6 @@ CropRecord rows that link them to detections.
 
 The full chain:
   media_result   → detections + crops + INFERENCE TASKS published
-                   (or, if the worker reported status=failed — e.g. a video
-                   over the plan's length — the session is marked failed)
   inference_result → prediction persisted; if all faces for this session
                      now have predictions, the BURN TASK is published
   burn_result    → session marked complete (or failed)
@@ -61,13 +59,6 @@ class PipelineService:
     # ══════════════════════════════════════════
 
     async def handle_media_result(self, message: dict) -> None:
-        # The worker publishes a slim {status: "failed", error, ...} dict on
-        # errors. It isn't a MediaResult (no faces), so handle it first —
-        # otherwise validation fails and the job sits in "processing".
-        if message.get("status") == "failed":
-            await self._fail_from_media(message)
-            return
-
         result = MediaResult.model_validate(message)
 
         job = await self.jobs.find_by_id(result.session_id)
@@ -215,36 +206,6 @@ class PipelineService:
     # ══════════════════════════════════════════
     # Internal
     # ══════════════════════════════════════════
-
-    async def _fail_from_media(self, message: dict) -> None:
-        session_id = message.get("session_id")
-        if not session_id:
-            logger.error("Failed media_result without session_id: %s", message)
-            return
-        job = await self.jobs.find_by_id(session_id)
-        if not job or job.status in ("complete", "failed"):
-            return
-        if job.mode == "live":
-            # One bad live frame shouldn't end the session.
-            logger.warning(
-                "Live frame failed for %s: %s", session_id, message.get("error")
-            )
-            return
-        raw = str(message.get("error") or "")[:500]
-        code = message.get("code")
-        logger.error("Media failed for session %s (%s): %s", session_id, code, raw)
-        # Only worker errors tagged with a code are written for users; raw
-        # exception text stays internal (error_detail).
-        error = raw if code else "Processing failed"
-        await self.jobs.mark_failed(
-            session_id,
-            metadata={
-                **(job.metadata_ or {}),
-                "error": error,
-                "error_code": code,
-                "error_detail": raw,
-            },
-        )
 
     async def _find_detection_id(
         self, session_id: str, frame_number: int, face_index: int

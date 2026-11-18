@@ -62,44 +62,6 @@ BURN_RESULTS_TOPIC = os.getenv("BURN_RESULTS_TOPIC", "burn_results")
 WS_MAX_FRAME_SIZE = int(os.getenv("WS_MAX_FRAME_SIZE", str(2 * 1024 * 1024)))  # 2 MB
 
 
-# ─── Plan limits (live mode) ──────────────────────────────────────────
-#
-# The gateway owns the full plan table (app/Config/Config.py PLANS there).
-# The orchestrator enforces live mode on its own WebSocket, so it keeps a
-# copy of the live numbers — keep them in sync with the gateway. Plan comes
-# from the access token's `plan` claim; unknown/missing → free. Tokens with
-# is_admin=true are unlimited.
-
-DEFAULT_PLAN = "free"
-
-LIVE_LIMITS: dict[str, dict[str, int]] = {
-    "free": {
-        "live_minutes_per_month": int(os.getenv("PLAN_FREE_LIVE_MINUTES_PER_MONTH", "15")),
-        "live_session_max_seconds": int(os.getenv("PLAN_FREE_LIVE_SESSION_MAX_SECONDS", "120")),
-    },
-    "pro": {
-        "live_minutes_per_month": int(os.getenv("PLAN_PRO_LIVE_MINUTES_PER_MONTH", "600")),
-        "live_session_max_seconds": int(os.getenv("PLAN_PRO_LIVE_SESSION_MAX_SECONDS", "1800")),
-    },
-}
-
-# WS close code for plan-limit closes (4000-4999 = application-defined).
-WS_CLOSE_LIMIT = 4002
-
-
-# ─── Usage accounting ─────────────────────────────────────────────────
-
-# A live row is charged (completed_at or now) - created_at, capped here so a
-# row whose session died without completed_at can't eat a month's quota.
-# Callers can pass a tighter cap (the plan's session max).
-LIVE_SESSION_CAP_SECONDS = int(os.getenv("LIVE_SESSION_CAP_SECONDS", str(2 * 3600)))
-
-# Photo/video jobs in processing/burning only count as "active" if created
-# within this window. Jobs that never reach a terminal status (e.g. a lost
-# media result) would otherwise block a user's concurrent-job slot forever.
-ACTIVE_JOB_STALE_SECONDS = int(os.getenv("ACTIVE_JOB_STALE_SECONDS", "1800"))
-
-
 # ─── CORS ─────────────────────────────────────────────────────────────
 
 CORS_ORIGINS = os.getenv(

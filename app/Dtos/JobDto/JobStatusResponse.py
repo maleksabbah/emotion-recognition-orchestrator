@@ -14,4 +14,3 @@ class JobStatusResponse(BaseModel):
     total_frames: int = 0
     total_faces: int = 0
     eta_seconds: Optional[float] = None
-    error: Optional[str] = None  # set when status == "failed" and a reason is known

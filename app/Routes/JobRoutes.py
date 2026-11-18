@@ -6,21 +6,19 @@ Job routes — HTTP endpoints the gateway calls.
   GET  /api/sessions                  list sessions
   GET  /api/sessions/{id}/status      progress snapshot
   POST /api/sessions/{id}/end         end a session (idempotent)
-  GET  /api/usage?user_id=...         this UTC month's usage (plan limits)
 """
 from __future__ import annotations
 
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, status
 
 from app.Dtos.JobDto.CreateJobRequest import CreateJobRequest
 from app.Dtos.JobDto.JobResponse import JobResponse
 from app.Dtos.JobDto.JobStatusResponse import JobStatusResponse
 from app.Dtos.JobDto.UploadJobRequest import UploadJobRequest
 from app.Dtos.JobDto.UploadJobResponse import UploadJobResponse
-from app.Dtos.JobDto.UsageResponse import UsageResponse
 from app.Services.JobService import JobService
 from app.Dependencies import get_job_service
 from app.Security.ServiceAuth import require_service_auth
@@ -69,12 +67,3 @@ async def end_session(
 ) -> dict:
     await jobs.end_session(str(session_id))
     return {"status": "ended"}
-
-
-@router.get("/usage", response_model=UsageResponse)
-async def get_usage(
-    user_id: str = Query(..., min_length=1),
-    live_session_cap_seconds: Optional[int] = Query(None, gt=0),
-    jobs: JobService = Depends(get_job_service),
-) -> UsageResponse:
-    return await jobs.get_usage(user_id, live_session_cap_seconds=live_session_cap_seconds)
