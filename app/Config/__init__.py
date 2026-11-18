@@ -34,12 +34,6 @@ from app.Config.Config import (
     BURN_RESULTS_TOPIC,
     # WS
     WS_MAX_FRAME_SIZE,
-    WS_CLOSE_LIMIT,
-    # Plans / usage
-    DEFAULT_PLAN,
-    LIVE_LIMITS,
-    LIVE_SESSION_CAP_SECONDS,
-    ACTIVE_JOB_STALE_SECONDS,
     # CORS
     CORS_ORIGINS,
 )
@@ -75,12 +69,6 @@ __all__ = [
     "BURN_RESULTS_TOPIC",
     # WS
     "WS_MAX_FRAME_SIZE",
-    "WS_CLOSE_LIMIT",
-    # Plans / usage
-    "DEFAULT_PLAN",
-    "LIVE_LIMITS",
-    "LIVE_SESSION_CAP_SECONDS",
-    "ACTIVE_JOB_STALE_SECONDS",
     # CORS
     "CORS_ORIGINS",
     # DB

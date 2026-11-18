@@ -1,19 +1,14 @@
 """
 LiveSessionService — owns a single WebSocket connection's lifecycle.
 
-Built once via Depends() with shared infra. The WS route calls admit() to
-check plan limits, open() to bind the per-connection bits (websocket,
-user_id), then drives start → handle_frame → stop.
+Built once via Depends() with shared infra. The WS route calls open() to
+bind the per-connection bits (websocket, user_id), then drives start →
+handle_frame → stop.
 
-  - admit(user)          plan limits: monthly live seconds left, one open
-                         session per user. Returns this session's time
-                         limit (None = unlimited) or raises LiveLimitReached.
   - start()              create the DB session, send session_created,
                          spin up the results-streaming task
   - handle_frame(bytes)  cache in Redis, publish MediaTask
-  - notify_limit()       tell the client the time limit hit, close 4002
   - stop()               cancel stream task, cleanup Redis, end session
-                         (stamps completed_at), release the per-user claim
   - _pump_results()      background loop forwarding stream:live entries to WS
 """
 from __future__ import annotations
@@ -25,12 +20,10 @@ from typing import Optional
 
 from fastapi import WebSocket
 
-from app.Config import DEFAULT_PLAN, LIVE_LIMITS, WS_CLOSE_LIMIT, WS_MAX_FRAME_SIZE
+from app.Config import WS_MAX_FRAME_SIZE
 from app.Dtos.JobDto.CreateJobRequest import CreateJobRequest
 from app.Dtos.TaskDto.MediaTask import FrameSource, MediaTask
-from app.Exceptions import LiveLimitReached
 from app.Repositories.RedisRepository import RedisRepository
-from app.Services.AuthService import TokenUser
 from app.Services.JobService import JobService
 
 logger = logging.getLogger("orchestrator.live")
@@ -53,82 +46,12 @@ class LiveSessionService:
         self._frame_number = 0
         self._stream_task: Optional[asyncio.Task] = None
         self._running = False
-        self._stopped = False
-
-        # Plan-limit state (set by admit())
-        self._claim_user_id: Optional[str] = None
-        self._claim_token: Optional[str] = None
-        self._limit_reason: str = "Live session limit reached"
-        self._limit_detail: str = "Live session limit reached."
 
     def open(self, websocket: WebSocket, user_id: str) -> "LiveSessionService":
         """Bind this service to one WS connection. Returns self so you can chain."""
         self.ws = websocket
         self.user_id = user_id
         return self
-
-    # ══════════════════════════════════════════
-    # Plan limits
-    # ══════════════════════════════════════════
-
-    async def admit(self, user: TokenUser) -> Optional[int]:
-        """
-        Check the user's plan before the session starts. Returns how many
-        seconds this session may run (None = unlimited), or raises
-        LiveLimitReached with a short reason for the WS close frame.
-        """
-        if user.is_admin:
-            return None
-
-        limits = LIVE_LIMITS.get(user.plan) or LIVE_LIMITS[DEFAULT_PLAN]
-        monthly_minutes = limits["live_minutes_per_month"]
-        session_max = limits["live_session_max_seconds"]
-
-        usage = await self.jobs.get_usage(user.id, live_session_cap_seconds=session_max)
-        remaining = monthly_minutes * 60 - usage.live_seconds
-        if remaining <= 0:
-            raise LiveLimitReached("Monthly live limit reached")
-
-        token = uuid.uuid4().hex
-        try:
-            claimed = await self.redis.try_claim_live_user(
-                user.id, token, ttl_seconds=session_max + 30
-            )
-        except Exception as e:
-            # Redis trouble: don't block on the one-session guard — the time
-            # limits below are still enforced in-process.
-            logger.error("live claim failed for user %s (allowing): %s", user.id, e)
-            claimed, token = True, None
-        if not claimed:
-            raise LiveLimitReached("Live session already open")
-        self._claim_user_id = user.id
-        self._claim_token = token
-
-        if remaining < session_max:
-            self._limit_reason = "Monthly live limit reached"
-            self._limit_detail = (
-                f"You've used all {monthly_minutes} live minutes for this month."
-            )
-            return remaining
-        self._limit_reason = "Live session limit reached"
-        self._limit_detail = (
-            f"Live sessions on your plan are limited to {_duration(session_max)}."
-        )
-        return session_max
-
-    async def notify_limit(self) -> None:
-        """Time limit hit: send a limit message, then close with 4002."""
-        if self.ws is None:
-            return
-        try:
-            await self.ws.send_json({
-                "type": "limit",
-                "code": "live_limit",
-                "detail": self._limit_detail,
-            })
-            await self.ws.close(code=WS_CLOSE_LIMIT, reason=self._limit_reason)
-        except Exception as e:
-            logger.info("notify_limit on closed socket (%s): %s", self.session_id, e)
 
     # ══════════════════════════════════════════
     # Lifecycle
@@ -174,13 +97,8 @@ class LiveSessionService:
         self._frame_number += 1
 
     async def stop(self) -> None:
-        """
-        Idempotent. Runs even if start() failed part-way, so a created
-        session row always gets completed_at and the claim is released.
-        """
-        if self._stopped:
+        if not self._running:
             return
-        self._stopped = True
         self._running = False
 
         if self._stream_task:
@@ -191,19 +109,9 @@ class LiveSessionService:
                 pass
 
         if self.session_id:
-            try:
-                await self.redis.cleanup_session(self.session_id)
-            except Exception as e:
-                logger.error("cleanup_session failed for %s: %s", self.session_id, e)
+            await self.redis.cleanup_session(self.session_id)
             await self.jobs.end_session(self.session_id)
             logger.info("Live session %s ended", self.session_id)
-
-        if self._claim_user_id and self._claim_token:
-            try:
-                await self.redis.release_live_user(self._claim_user_id, self._claim_token)
-            except Exception as e:
-                logger.warning("release_live_user failed for %s: %s", self._claim_user_id, e)
-            self._claim_token = None
 
     # ══════════════════════════════════════════
     # Internal — results pump
@@ -225,8 +133,7 @@ class LiveSessionService:
                 await asyncio.sleep(0.5)
 
 
-def _duration(seconds: int) -> str:
-    if seconds % 60 == 0:
-        minutes = seconds // 60
-        return f"{minutes} minute{'s' if minutes != 1 else ''}"
-    return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+
+
+
