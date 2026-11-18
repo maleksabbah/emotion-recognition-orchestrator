@@ -6,6 +6,7 @@ PipelineService consumes results via dedicated KafkaConsumer loops.
 """
 from __future__ import annotations
 
+import ssl
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from app.Config.Config import (
@@ -21,6 +22,7 @@ def _sasl_kwargs() -> dict:
     if KAFKA_SASL_USERNAME:
         return {
             "security_protocol": "SASL_SSL",
+            "ssl_context": ssl.create_default_context(),
             "sasl_mechanism": "SCRAM-SHA-256",
             "sasl_plain_username": KAFKA_SASL_USERNAME,
             "sasl_plain_password": KAFKA_SASL_PASSWORD,
