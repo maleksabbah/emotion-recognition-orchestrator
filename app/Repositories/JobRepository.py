@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.Entities.Job import Job
@@ -33,6 +33,57 @@ class JobRepository:
         stmt = stmt.order_by(Job.created_at.desc()).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    # ── Usage (plan limits) ──────────────────────────
+
+    async def count_usage(
+        self, user_id: str, month_start: datetime, active_since: datetime
+    ) -> dict[str, int]:
+        """
+        One query, three counts for a user:
+          photos / videos  created since month_start, source uploaded, not failed
+          active_jobs      photo/video in processing|burning, created since active_since
+        """
+        owner = Job.metadata_["user_id"].astext == user_id
+        billable = and_(
+            Job.created_at >= month_start,
+            Job.source_s3_key.isnot(None),
+            Job.status != "failed",
+        )
+        active = and_(
+            Job.mode.in_(("photo", "video")),
+            Job.status.in_(("processing", "burning")),
+            Job.created_at >= active_since,
+        )
+        stmt = select(
+            func.count().filter(and_(Job.mode == "photo", billable)),
+            func.count().filter(and_(Job.mode == "video", billable)),
+            func.count().filter(active),
+        ).where(owner, Job.created_at >= min(month_start, active_since))
+        photos, videos, active_jobs = (await self.db.execute(stmt)).one()
+        return {
+            "photos": int(photos or 0),
+            "videos": int(videos or 0),
+            "active_jobs": int(active_jobs or 0),
+        }
+
+    async def sum_live_seconds(
+        self, user_id: str, month_start: datetime, cap_seconds: int
+    ) -> int:
+        """
+        Sum over this month's live rows of (completed_at or now) - created_at,
+        each clamped to [0, cap_seconds] so a row left open can't eat the quota.
+        """
+        ended = func.coalesce(Job.completed_at, func.now())
+        duration = func.extract("epoch", ended - Job.created_at)
+        clamped = func.least(func.greatest(duration, 0), cap_seconds)
+        stmt = select(func.coalesce(func.sum(clamped), 0)).where(
+            Job.metadata_["user_id"].astext == user_id,
+            Job.mode == "live",
+            Job.created_at >= month_start,
+        )
+        total = (await self.db.execute(stmt)).scalar_one()
+        return int(float(total or 0))
 
     # ── Writes ───────────────────────────────────────
 
@@ -89,6 +140,28 @@ class JobRepository:
         }
         if burned_s3_key is not None:
             values["burned_s3_key"] = burned_s3_key
+        await self.db.execute(update(Job).where(Job.id == uid).values(**values))
+
+    async def set_metadata(self, job_id: str | uuid.UUID, metadata: dict) -> None:
+        """Replace the metadata JSONB. Callers merge first (read → merge → write)."""
+        uid = _as_uuid(job_id)
+        await self.db.execute(
+            update(Job).where(Job.id == uid).values(metadata_=metadata)
+        )
+
+    async def mark_failed(
+        self,
+        job_id: str | uuid.UUID,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """status='failed' + completed_at; optionally replace metadata (e.g. with an error)."""
+        uid = _as_uuid(job_id)
+        values: dict = {
+            "status": "failed",
+            "completed_at": datetime.now(timezone.utc),
+        }
+        if metadata is not None:
+            values["metadata_"] = metadata
         await self.db.execute(update(Job).where(Job.id == uid).values(**values))
 
     async def try_set_burning(self, job_id: str | uuid.UUID) -> bool:

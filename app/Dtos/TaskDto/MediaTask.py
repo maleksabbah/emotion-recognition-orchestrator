@@ -24,3 +24,6 @@ class MediaTask(BaseModel):
     frame_number: int
     frame_source: FrameSource
     timestamp_ms: float = 0.0
+    # Plan limit for batch video jobs; None = no limit (admins, photos, live).
+    # The worker probes the duration and fails the job if it's longer.
+    max_video_seconds: Optional[int] = None
