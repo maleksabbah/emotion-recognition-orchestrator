@@ -63,6 +63,11 @@ class NotFound(DomainException):
     default_detail = "Not found"
 
 
+class LiveLimitReached(Forbidden):
+    """Plan limit for live mode. The WS route turns it into close code 4002."""
+    default_detail = "Live limit reached"
+
+
 # ══════════════════════════════════════════════
 # 5xx — upstream
 # ══════════════════════════════════════════════

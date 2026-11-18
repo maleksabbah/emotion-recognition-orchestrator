@@ -3,7 +3,7 @@ AuthService — JWT validation only.
 
 Orchestrator has no users table. The gateway is the issuer of access
 tokens; orchestrator only verifies and reads `sub` (user_id) to know
-which user is connecting.
+which user is connecting, plus `plan` / `is_admin` for live-mode limits.
 
 Used by the WS route to authenticate the live session — gateway already
 authenticates the HTTP routes (internal network, trusted).
@@ -14,7 +14,7 @@ from typing import Any
 
 import jwt
 
-from app.Config import JWT_ALGORITHM, JWT_SECRET
+from app.Config import DEFAULT_PLAN, JWT_ALGORITHM, JWT_SECRET
 from app.Exceptions import (
     InvalidToken,
     InvalidTokenType,
@@ -24,9 +24,11 @@ from app.Exceptions import (
 
 
 class TokenUser:
-    """Lightweight user shape — just id. No DB lookup."""
-    def __init__(self, user_id: str):
+    """Lightweight user shape from JWT claims. No DB lookup."""
+    def __init__(self, user_id: str, plan: str = DEFAULT_PLAN, is_admin: bool = False):
         self.id = user_id
+        self.plan = plan
+        self.is_admin = is_admin
 
 
 class AuthService:
@@ -52,4 +54,10 @@ class AuthService:
         sub = payload.get("sub")
         if sub is None:
             raise InvalidToken()
-        return TokenUser(user_id=str(sub))
+        plan = payload.get("plan")
+        return TokenUser(
+            user_id=str(sub),
+            # Tokens minted before plans existed have no claim → free.
+            plan=plan if isinstance(plan, str) and plan else DEFAULT_PLAN,
+            is_admin=payload.get("is_admin") is True,
+        )

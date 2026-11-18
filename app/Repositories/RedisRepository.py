@@ -21,6 +21,7 @@ import redis.asyncio as redis
 _FRAME_PREFIX = "frame"           # frame:{session_id}:{frame_id} → bytes
 _QUEUE_PREFIX = "queue:frames"    # queue:frames:{session_id} → list of JSON refs
 _STREAM_PREFIX = "stream:live"    # stream:live:{session_id} → XADD entries
+_LIVE_USER_PREFIX = "live:user"   # live:user:{user_id} → token of the open session
 _FRAME_TTL_SECONDS = 30
 
 
@@ -111,6 +112,31 @@ class RedisRepository:
                     raw = raw.decode("utf-8")
                 payloads.append(json.loads(raw))
         return payloads, new_last_id
+
+    # ══════════════════════════════════════════
+    # One open live session per user
+    # ══════════════════════════════════════════
+    #
+    # SET NX with a TTL slightly over the plan's session max, so a crashed
+    # orchestrator can't leave the user locked out. Release only if we still
+    # own it (compare-and-delete).
+
+    _RELEASE_LUA = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+
+    async def try_claim_live_user(
+        self, user_id: str, token: str, ttl_seconds: int
+    ) -> bool:
+        return bool(await self.r.set(
+            f"{_LIVE_USER_PREFIX}:{user_id}", token, nx=True, ex=ttl_seconds
+        ))
+
+    async def release_live_user(self, user_id: str, token: str) -> None:
+        await self.r.eval(
+            self._RELEASE_LUA, 1, f"{_LIVE_USER_PREFIX}:{user_id}", token
+        )
 
     # ══════════════════════════════════════════
     # Cleanup on session end
