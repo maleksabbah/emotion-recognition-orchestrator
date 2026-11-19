@@ -93,7 +93,7 @@ LIVE_LIMITS: dict[str, dict[str, int]] = {
         "live_session_max_seconds": int(os.getenv("PLAN_FREE_LIVE_SESSION_MAX_SECONDS", "120")),
     },
     "pro": {
-        "live_minutes_per_month": int(os.getenv("PLAN_PRO_LIVE_MINUTES_PER_MONTH", "600")),
+        "live_minutes_per_month": int(os.getenv("PLAN_PRO_LIVE_MINUTES_PER_MONTH", "300")),
         "live_session_max_seconds": int(os.getenv("PLAN_PRO_LIVE_SESSION_MAX_SECONDS", "1800")),
     },
 }
