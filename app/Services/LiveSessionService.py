@@ -80,12 +80,19 @@ class LiveSessionService:
         if user.is_admin:
             return None
 
-        limits = LIVE_LIMITS.get(user.plan) or LIVE_LIMITS[DEFAULT_PLAN]
-        monthly_minutes = limits["live_minutes_per_month"]
-        session_max = limits["live_session_max_seconds"]
+        # The gateway owns the plans and puts this user's live limits in the
+        # token. LIVE_LIMITS is only a fallback for tokens without the claim.
+        if user.live is not None:
+            monthly_seconds = user.live["monthly_seconds"]
+            session_max = user.live["session_max_seconds"]
+        else:
+            limits = LIVE_LIMITS.get(user.plan) or LIVE_LIMITS[DEFAULT_PLAN]
+            monthly_seconds = limits["live_minutes_per_month"] * 60
+            session_max = limits["live_session_max_seconds"]
+        monthly_minutes = monthly_seconds // 60
 
         usage = await self.jobs.get_usage(user.id, live_session_cap_seconds=session_max)
-        remaining = monthly_minutes * 60 - usage.live_seconds
+        remaining = monthly_seconds - usage.live_seconds
         if remaining <= 0:
             raise LiveLimitReached("Monthly live limit reached")
 

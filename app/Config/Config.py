@@ -8,6 +8,7 @@ issued by gateway validate here for the WS auth.
 from __future__ import annotations
 
 import os
+import re
 
 
 # ─── JWT / Auth (shared with gateway) ──────────────────────────────────
@@ -21,9 +22,23 @@ JWT_ALGORITHM = "HS256"
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "emotion")
-POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 ORCHESTRATOR_DB = os.getenv("ORCHESTRATOR_DB", "orchestrator_db")
-ORCHESTRATOR_DB_URL = os.getenv("DATABASE_URL") or (
+def _asyncpg_url(url: str) -> str:
+    """
+    Normalise a provider URL for SQLAlchemy + asyncpg. Railway/Supabase hand
+    out postgres:// or postgresql://; asyncpg also rejects libpq's sslmode=,
+    so map it to its own ssl= parameter.
+    """
+    url = re.sub(r"^postgres(ql)?://", "postgresql+asyncpg://", url)
+    return re.sub(r"([?&])sslmode=", r"\1ssl=", url)
+
+
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not _DATABASE_URL and not POSTGRES_PASSWORD:
+    raise RuntimeError("Set DATABASE_URL, or POSTGRES_PASSWORD with the POSTGRES_* parts")
+
+ORCHESTRATOR_DB_URL = _asyncpg_url(_DATABASE_URL) if _DATABASE_URL else (
     f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
     f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{ORCHESTRATOR_DB}"
 )
@@ -64,11 +79,11 @@ WS_MAX_FRAME_SIZE = int(os.getenv("WS_MAX_FRAME_SIZE", str(2 * 1024 * 1024)))  #
 
 # ─── Plan limits (live mode) ──────────────────────────────────────────
 #
-# The gateway owns the full plan table (app/Config/Config.py PLANS there).
-# The orchestrator enforces live mode on its own WebSocket, so it keeps a
-# copy of the live numbers — keep them in sync with the gateway. Plan comes
-# from the access token's `plan` claim; unknown/missing → free. Tokens with
-# is_admin=true are unlimited.
+# The gateway owns the plans (its plans table) and puts each user's live
+# limits in the access token's `live` claim; that's what admit() uses.
+# LIVE_LIMITS below is only a FALLBACK for tokens without the claim, keyed
+# by the `plan` claim (unknown/missing → free). Tokens with is_admin=true
+# are unlimited.
 
 DEFAULT_PLAN = "free"
 

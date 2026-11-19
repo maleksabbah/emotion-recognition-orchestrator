@@ -10,7 +10,7 @@ authenticates the HTTP routes (internal network, trusted).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import jwt
 
@@ -24,11 +24,25 @@ from app.Exceptions import (
 
 
 class TokenUser:
-    """Lightweight user shape from JWT claims. No DB lookup."""
-    def __init__(self, user_id: str, plan: str = DEFAULT_PLAN, is_admin: bool = False):
+    """
+    Lightweight user shape from JWT claims. No DB lookup.
+
+    `live` = {"monthly_seconds", "session_max_seconds"} set by the gateway
+    from its plans table, or None when the token doesn't carry it (minted
+    before this claim existed) — the caller then uses the LIVE_LIMITS
+    fallback for `plan`.
+    """
+    def __init__(
+        self,
+        user_id: str,
+        plan: str = DEFAULT_PLAN,
+        is_admin: bool = False,
+        live: Optional[dict[str, int]] = None,
+    ):
         self.id = user_id
         self.plan = plan
         self.is_admin = is_admin
+        self.live = live
 
 
 class AuthService:
@@ -60,4 +74,19 @@ class AuthService:
             # Tokens minted before plans existed have no claim → free.
             plan=plan if isinstance(plan, str) and plan else DEFAULT_PLAN,
             is_admin=payload.get("is_admin") is True,
+            live=_live_claim(payload.get("live")),
         )
+
+
+def _live_claim(value: Any) -> Optional[dict[str, int]]:
+    """Validate the gateway's `live` claim; anything malformed → None (fallback)."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        monthly = int(value["monthly_seconds"])
+        session_max = int(value["session_max_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if monthly < 0 or session_max <= 0:
+        return None
+    return {"monthly_seconds": monthly, "session_max_seconds": session_max}
